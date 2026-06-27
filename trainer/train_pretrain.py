@@ -20,6 +20,8 @@ from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint
 
 warnings.filterwarnings('ignore')
 
+# Automatic Mixed Precision Training
+# ref: https://docs.pytorch.org/docs/2.12/notes/amp_examples.html
 
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     start_time = time.time()

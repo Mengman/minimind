@@ -89,6 +89,29 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     return (x[:, :, :, None, :].expand(bs, slen, num_key_value_heads, n_rep, head_dim).reshape(bs, slen, num_key_value_heads * n_rep, head_dim))
 
 class Attention(nn.Module):
+    """
+    模块结构： GQA
+    input: x (batch_size, seq_len, hidden_size)
+        ↓
+    计算 QKV:
+        Q shape (batch_size, seq_len, n_local_heads, head_dim) ->reshape-> (batch_size, n_local_heads, seq_len, head_dim)
+        K, V shape (batch_size, seq_len, n_local_kv_heads, head_dim) ->reshape-> (batch_size, n_local_kv_heads[kv group num], seq_len, head_dim)
+        ↓
+    RMSNorm_Q, RMSNorm_K
+        ↓
+    Q K 做 Rope position embedding
+        ↓
+    repeat K shape (batch_size, n_local_kv_heads[kv group num], seq_len, head_dim) ->repeat-> (batch_size, n_local_heads, seq_len, head_dim)
+        ↓
+    attention_score = QK/head_dim**0.5 * attention_mask:  output shape (batch_size, n_local_heads, seq_len, seq_len)
+        ↓
+    Dropout(softmax(attention_score)) * V： output shape (batch_size, n_local_heads, seq_len, head_dim)
+        ->reshape-> (batch_size, seq_len, n_local_heads * head_dim)
+        ↓
+    o_proj [n_local_heads * head_dim, hidden_size] :  output shape  (batch_size, seq_len, hidden_size)
+        ↓
+    Dropout
+    """
     def __init__(self, config: MiniMindConfig):
         super().__init__()
         self.num_key_value_heads = config.num_attention_heads if config.num_key_value_heads is None else config.num_key_value_heads
@@ -123,9 +146,16 @@ class Attention(nn.Module):
         past_kv = (xk, xv) if use_cache else None
         xq, xk, xv = (xq.transpose(1, 2), repeat_kv(xk, self.n_rep).transpose(1, 2), repeat_kv(xv, self.n_rep).transpose(1, 2))
         if self.flash and (seq_len > 1) and (not self.is_causal or past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
+            # 使用 FlashAttention v2
+            # 条件： self.flash = True
+            #       输入长度 seq_len > 1
+            #       self.is_causal = False || 没有 KV cache
+            #       没有传入 attention_mask || attention_mask 的值全部是 1
             output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=self.is_causal)
         else:
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            # attention_mask 是  shape 为 [seq_len, seq_len] 的 下三角阵
+            # 对角线和下三角部分都是 0，其他部分是 -inf; -inf 部分就不参与 softmax 的计算
             if self.is_causal: scores[:, :, :, -seq_len:] += torch.full((seq_len, seq_len), float("-inf"), device=scores.device).triu(1)
             if attention_mask is not None: scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9
             output = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(xq)) @ xv
@@ -176,6 +206,24 @@ class MOEFeedForward(nn.Module):
         return y.view(batch_size, seq_len, hidden_dim)
 
 class MiniMindBlock(nn.Module):
+    """
+    模块结构
+    input: 
+        hidden_state: (batch_size, seq_len, hidden_size)
+        position_embeddings
+        ↓
+    Self-Attention: output shape (batch_size, seq_len, hidden_size)
+        ↓
+    residual: hidden_state + input-hidden_state
+        ↓
+    RMSNorm
+        ↓
+    FNN or MoE: output shape (batch_size, seq_len, hidden_size)
+        ↓
+    residual: hidden_state + input-hidden_state
+        ↓
+    output: hidden_state, kv_cache
+    """
     def __init__(self, layer_id: int, config: MiniMindConfig):
         super().__init__()
         self.self_attn = Attention(config)
@@ -194,6 +242,22 @@ class MiniMindBlock(nn.Module):
         return hidden_states, present_key_value
 
 class MiniMindModel(nn.Module):
+    """
+    模型架构：
+    input: token_ids shape(batch_size, seq_len, 1)
+        ↓
+    token_embedding: output shape (batch_size, seq_len, hidden_size)
+        ↓
+    dropout
+        ↓
+    MiniMindBlock * k: output shape (batch_size, seq_len, hidden_size)
+        ↓
+    RMSNorm
+        ↓
+    求和 MoE aux_loss
+        ↓
+        输出: hidden_state, kv_cache, aux_loss
+    """
     def __init__(self, config: MiniMindConfig):
         super().__init__()
         self.config = config
@@ -232,6 +296,14 @@ class MiniMindModel(nn.Module):
         return hidden_states, presents, aux_loss
 
 class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
+    """
+    在 MiniMindModel 的基础上添加以下内容
+    1. lm_head: 负责将 transformer block 输出的 hidden_state 转化到 vocab_embedding logits
+        输入的 token_embeding 层的参数可以与 lm_head 共享
+        token_embeding.weight [vocab_size, hidden_size]
+        lm_head.weight [hidden_size, vocab_size]
+    2. 计算 token prediction loss:  交叉熵 loss
+    """
     config_class = MiniMindConfig
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     def __init__(self, config: MiniMindConfig = None):
