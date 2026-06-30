@@ -316,11 +316,22 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
 
     def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False, logits_to_keep=0, labels=None, **kwargs):
         hidden_states, past_key_values, aux_loss = self.model(input_ids, attention_mask, past_key_values, use_cache, **kwargs)
+        # 默认情况下 logits_to_keep=0 -> slice_indices=(0, None, None)
+        # lm_head 会计算所有序列的 logits -> logits.shape (batch_size, seq_len, vocab_size)
+
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
         loss = None
         if labels is not None:
-            x, y = logits[..., :-1, :].contiguous(), labels[..., 1:].contiguous()
+            # logits 提取 [0:seq_len - 1]
+            # labels 提取 [1:seq_len]
+            # 举例解释： 输入的训练样本 input = [fox, jumps, over, the, lazy, dog, <eos>, -100, -100, ...]
+            # logits的预测目标是              [jumps, over, the, lazy, dog, <eos>, dont_care, dont_care, ...]
+            # 所以 label 应该是  input[1:] = [jumps, over, the, lazy, dog, <eos>,  -100, -100, ...]
+            # x shape=(batch_size, seq_len - 1, vocab_size)
+            # y shape=(batch_size, seq_len - 1)
+            x, y = logits[..., :-1, :].contiguous(), labels[..., 1:].contiguous() 
+
             loss = F.cross_entropy(x.view(-1, x.size(-1)), y.view(-1), ignore_index=-100)
         return MoeCausalLMOutputWithPast(loss=loss, aux_loss=aux_loss, logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)
     

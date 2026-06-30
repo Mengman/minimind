@@ -45,6 +45,15 @@ class PretrainDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, index):
+        """
+        训练数据处理流程：
+        1. 按照 index 去一条 json string 数据样本；
+        2. 将样本 token 化，最大长度为 max_length - 2, 超出部分直接 truncate；
+        3. 在每个样本的 token 序列前后分别加上特殊token <bos> + tokens + <eos>； 这就是为什么上一部分最大长度要减2
+        4. 将样本 token 序列通过 padding token 扩充到 max_length  长度；
+        5. 构造 label: label 是 input token 的拷贝，但是将所有 padding token 设置为 -100； pytorch 交叉熵计算时候会忽略 -100 这个分类编号
+            也就是 padding 部分不计算 loss
+        """
         sample = self.samples[index]
         tokens = self.tokenizer(str(sample['text']), add_special_tokens=False, max_length=self.max_length - 2, truncation=True).input_ids
         tokens = [self.tokenizer.bos_token_id] + tokens + [self.tokenizer.eos_token_id]
